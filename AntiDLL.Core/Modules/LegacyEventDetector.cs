@@ -205,7 +205,10 @@ internal sealed unsafe class LegacyEventDetector
         {
             var slot   = new PlayerSlot((byte) slotIndex);
             var client = _bridge.ClientManager.GetGameClient(slot);
-            if (client is null || !client.IsValid)
+            // Validity gate is IsInGame (never just IsValid/IsConnected): the legacy listen-bits packet can
+            // arrive during the loading/limbo window where the client is half-valid. Bots/HLTV are filtered
+            // by IsExempt below.
+            if (client is not { IsInGame: true })
                 return;
 
             if (_sink.IsExempt(client))

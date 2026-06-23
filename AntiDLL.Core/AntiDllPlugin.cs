@@ -105,7 +105,13 @@ public sealed class AntiDllPlugin : IModSharpModule
             _logger.LogWarning("[AntiDLL] action=ban but AdminCommands is not loaded — bans will fall back to kicks");
     }
 
-    public void OnLibraryConnected(string name) { }
+    public void OnLibraryConnected(string name)
+    {
+        // Re-resolve the optional admin interfaces if AdminCommands/AdminManager (re)connect after our OAM,
+        // so a hot-reload of those modules doesn't leave us holding a stale/null reference.
+        if (name is "AdminCommands" or "AdminManager")
+            _bridge.ResolveModules();
+    }
 
     public void OnLibraryDisconnect(string name) { }
 
