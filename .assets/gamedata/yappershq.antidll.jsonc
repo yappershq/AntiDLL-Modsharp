@@ -1,0 +1,56 @@
+// AntiDLL gamedata — CS2 legacy game-event listen-bits path (libserver.so, Linux, stripped).
+//
+// ModSharp gamedata schema: top-level "Addresses" / "Offsets" / "VFuncs". An address entry =
+// { library, linux/windows byte-sig (? = single wildcard byte), optional "refs": { "strings": [...] } }.
+// FindPattern resolves the sig at runtime; refs.strings is the recompile-proof string-anchored fallback.
+//
+// Reverse-engineered from libserver.so (CS2 dedicated server, Linux). Re-derive on engine updates.
+// Full derivation (with the decisive disassembly) is recorded in docs/FINDINGS.md.
+//
+// ── Detection mechanism (faithful to KillStr3aK/JDW1337 CS2-AntiDLL) ─────────────────────────────
+// The engine fn CSource1LegacyGameEventGameSystem::ListenBitsReceived(this, proxy) runs every time a
+// client sends CLC_ListenEvents. The detour reads the per-client proxy that arg2 (SysV rsi) points at:
+//   proxy + 0x48  = int   listen-bit dword count
+//   proxy + 0x50  = void* listen-bit array (a 512-bit field, indexed by engine event id)
+//   proxy + 0x58  = int   per-client proxy slot index (== the player's engine slot, bounds <= 0x3F)
+// confirmed by disassembly:  movslq 0x58(%rsi),%rax ; cmp $0x3f,%eax ; mov 0x48(%rbx),%edx ;
+//                            mov 0x50(%rbx),%rcx ; loop 0..0x200 testing each bit.
+// The plugin reads the slot, then asks the engine (via ModSharp's IEventManager.FindListener, which
+// wraps IGameEventManager2::FindListener per-slot) whether that client subscribed to each blacklisted
+// event. Using the engine's own name->event-id resolution avoids any fragile descriptor-table RE.
+{
+  "Addresses": {
+    // The detour target. Located via the error string it loads on the unknown-event path:
+    //   "OnSource1LegacyGameEventListenBitsReceived: game event %i not found." (@ vaddr 0x90a6e0).
+    // Function entry @ vaddr 0x15894C0. Signature verified unique (1 match) against the current build.
+    "CSource1LegacyGameEventGameSystem::ListenBitsReceived": {
+      "library": "server",
+      "linux": "48 63 46 58 83 F8 3F 0F 87 ? ? ? ? 55 48 C1 E0 04 48 89 E5 41 56 41 55",
+      "refs": {
+        "strings": [ "OnSource1LegacyGameEventListenBitsReceived: game event %i not found." ]
+      }
+      // Windows sig intentionally omitted — the production servers are Linux. Add a server.dll prologue
+      // pattern here if Windows support is ever needed; the detector no-ops cleanly when unresolved.
+    }
+  },
+
+  // Documented for completeness / future raw-bit readers. The current plugin does NOT dereference
+  // these directly (it resolves subscriptions through ModSharp's managed IEventManager.FindListener),
+  // so a layout drift here cannot crash the detector. Recorded so a raw-bit variant can be built.
+  "Offsets": {
+    // proxy + 0x50 — pointer to the per-client legacy event listen-bit array (CSS "Listeners" offset 80,
+    // unchanged on the current CS2 build).
+    "CServerSideClientLegacyProxy::ListenBits":      { "linux": 80,  "windows": 80 },
+    // proxy + 0x48 — dword count of the listen-bit array.
+    "CServerSideClientLegacyProxy::ListenBitsCount": { "linux": 72,  "windows": 72 },
+    // proxy + 0x58 — per-client proxy slot index (== engine player slot).
+    "CServerSideClientLegacyProxy::SlotIndex":       { "linux": 88,  "windows": 88 }
+  },
+
+  // IGameEventManager2::FindListener — vtable index 16 (CGameEventManager 17-slot vtable, RTTI-resolved;
+  // AddListener = index 4). ModSharp core already binds this as Event.FindListener(slot, name), so the
+  // plugin uses the managed wrapper rather than calling the vfunc directly. Recorded for reference.
+  "VFuncs": {
+    "IGameEventManager2::FindListener": { "linux": 16, "windows": 16 }
+  }
+}

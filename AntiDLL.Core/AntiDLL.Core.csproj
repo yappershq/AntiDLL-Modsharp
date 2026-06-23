@@ -3,6 +3,8 @@
   <PropertyGroup>
     <AssemblyName>AntiDLL</AssemblyName>
     <RootNamespace>AntiDLL</RootNamespace>
+    <!-- Native mid-hook on ListenBitsReceived reads the per-client proxy via raw pointers. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
 </Project>

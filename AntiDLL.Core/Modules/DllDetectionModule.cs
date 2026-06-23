@@ -1,11 +1,7 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
 using AntiDLL.Configuration;
 using Microsoft.Extensions.Logging;
-using Sharp.Modules.AdminCommands.Shared;
 using Sharp.Shared.Enums;
 using Sharp.Shared.Listeners;
 using Sharp.Shared.Objects;
@@ -14,17 +10,19 @@ using Sharp.Shared.Units;
 namespace AntiDLL.Modules;
 
 /// <summary>
-///     Cheat-DLL detection by client-ConVar interrogation.
+///     SECONDARY (clearly-weaker) detector — cheat-DLL detection by client-ConVar interrogation.
 ///
-///     ModSharp's <see cref="Sharp.Shared.Managers.IClientManager.QueryConVar"/> asks the client for
-///     the value of a named cvar; the engine replies asynchronously and ModSharp invokes our callback
-///     ON THE GAME THREAD with a <see cref="QueryConVarValueStatus"/> and the value. We fire one query
-///     per configured <see cref="DllSignature"/> when a client passes the admin check, evaluate each
-///     reply against its match rule, accumulate the matches per slot, and once all outstanding queries
-///     for that client have returned we punish (notify / kick / ban) if any signature matched.
+///     This is NOT the upstream CS2-AntiDLL mechanism (that is <see cref="LegacyEventDetector" />, the
+///     primary native legacy-event-subscription detector). The cvar probe is kept only as an optional,
+///     additive tripwire: it is trivial for a cheat author to rename/hide a cvar, so it is OFF by default
+///     and never the sole line of defence. When enabled it runs alongside the primary detector and routes
+///     any hit through the same <see cref="DetectionSink" />.
 ///
-///     This is a DIFFERENT mechanism from upstream CS2-AntiDLL (which hooks the legacy game-event
-///     listen-bits path natively — not exposed by ModSharp managed APIs). See README for the verdict.
+///     ModSharp's <see cref="Sharp.Shared.Managers.IClientManager.QueryConVar" /> asks the client for the
+///     value of a named cvar; the engine replies asynchronously and ModSharp invokes our callback ON THE
+///     GAME THREAD. We fire one query per configured <see cref="DllSignature" /> when a client passes the
+///     admin check, evaluate each reply against its rule, and once all outstanding queries for that client
+///     have returned we flag (via the sink) if any signature matched.
 /// </summary>
 internal sealed class DllDetectionModule : IClientListener
 {
@@ -33,56 +31,49 @@ internal sealed class DllDetectionModule : IClientListener
 
     private readonly InterfaceBridge             _bridge;
     private readonly AntiDllConfig               _config;
+    private readonly DetectionSink               _sink;
     private readonly ILogger<DllDetectionModule> _logger;
 
-    private bool             _installed;
-    private DiscordWebhook?  _webhook;
-    private HashSet<string>? _sharedBypass;
+    private bool _installed;
 
     // Per-slot in-flight scan state. Keyed by engine slot value. Only ever touched on the game thread
     // (OnClientPostAdminCheck + QueryConVar callbacks both run there), so a plain Dictionary is safe.
     private sealed class ScanState
     {
         public required SteamID      SteamId;
-        public required string       SteamStr   = string.Empty;
-        public required string       Name       = string.Empty;
+        public required string       SteamStr = string.Empty;
         public          int          Outstanding;
-        public readonly List<string> Matches    = [];
+        public readonly List<string> Matches  = [];
         public          bool         Punished;
     }
 
     private readonly Dictionary<int, ScanState> _scans = new();
 
-    public DllDetectionModule(InterfaceBridge bridge, AntiDllConfig config, ILogger<DllDetectionModule> logger)
+    public DllDetectionModule(InterfaceBridge bridge, AntiDllConfig config, DetectionSink sink,
+        ILogger<DllDetectionModule> logger)
     {
         _bridge = bridge;
         _config = config;
+        _sink   = sink;
         _logger = logger;
-    }
-
-    public void Configure(DiscordWebhook webhook, HashSet<string> sharedBypass)
-    {
-        _webhook      = webhook;
-        _sharedBypass = sharedBypass;
     }
 
     public void Start()
     {
-        if (!_config.Enabled)
+        if (!_config.CvarProbeEnabled)
         {
-            _logger.LogInformation("[AntiDLL] Disabled by config");
+            _logger.LogInformation("[AntiDLL] Secondary cvar probe disabled by config");
             return;
         }
         if (_config.Signatures.Count == 0)
         {
-            _logger.LogWarning("[AntiDLL] No signatures configured — detection inactive");
+            _logger.LogInformation("[AntiDLL] Secondary cvar probe enabled but no signatures configured — inactive");
             return;
         }
 
         _bridge.ClientManager.InstallClientListener(this);
         _installed = true;
-        _logger.LogInformation("[AntiDLL] Active — action={Action}, signatures={Count}",
-            _config.Action, _config.Signatures.Count);
+        _logger.LogInformation("[AntiDLL] Secondary cvar probe active — {Count} signature(s)", _config.Signatures.Count);
     }
 
     public void Stop()
@@ -96,24 +87,15 @@ internal sealed class DllDetectionModule : IClientListener
     // Game thread.
     public void OnClientPostAdminCheck(IGameClient client)
     {
-        if (client.IsFakeClient || client.IsHltv)
+        if (_sink.IsExempt(client))
             return;
 
-        var steamId  = client.SteamId;
-        var steamStr = ((ulong) steamId).ToString();
-
-        if (_config.Whitelist.Contains(steamStr) || (_sharedBypass?.Contains(steamStr) ?? false))
-            return;
-
-        if (_config.AdminBypass && _bridge.AdminManager?.GetAdmin(steamId) is not null)
-            return;
-
-        var slot = client.Slot.AsPrimitive();
+        var steamId = client.SteamId;
+        var slot    = client.Slot.AsPrimitive();
         var state = new ScanState
         {
             SteamId  = steamId,
-            SteamStr = steamStr,
-            Name     = client.Name ?? "?",
+            SteamStr = ((ulong) steamId).ToString(),
         };
 
         // Issue one query per signature. Each callback decrements Outstanding; when it hits 0 we act.
@@ -126,12 +108,12 @@ internal sealed class DllDetectionModule : IClientListener
             try
             {
                 _bridge.ClientManager.QueryConVar(client, sig.Cvar,
-                    (c, status, name, value) => OnQueryResult(slot, localSig, c, status, value));
+                    (c, status, _, value) => OnQueryResult(slot, localSig, c, status, value));
                 state.Outstanding++;
             }
             catch (Exception e)
             {
-                _logger.LogWarning(e, "[AntiDLL] QueryConVar('{Cvar}') threw for {Steam}", sig.Cvar, steamStr);
+                _logger.LogWarning(e, "[AntiDLL] QueryConVar('{Cvar}') threw for {Steam}", sig.Cvar, state.SteamStr);
             }
         }
 
@@ -169,7 +151,7 @@ internal sealed class DllDetectionModule : IClientListener
             return;
 
         state.Punished = true;
-        Act(client, state);
+        _sink.Act(client, "cvar-probe", string.Join(", ", state.Matches));
     }
 
     /// <summary>Decide whether a single query result is incriminating per the signature's rule.</summary>
@@ -188,80 +170,6 @@ internal sealed class DllDetectionModule : IClientListener
                                    value.Contains(sig.Value, StringComparison.OrdinalIgnoreCase),
             _                   => false,
         };
-    }
-
-    // Game thread.
-    private void Act(IGameClient client, ScanState state)
-    {
-        // Re-validate: the player may have left, or the callback chain may have raced a disconnect.
-        if (!client.IsValid || !client.IsInGame || client.IsFakeClient)
-            return;
-
-        var sigList = string.Join(", ", state.Matches);
-        var action  = _config.Action;
-
-        _logger.LogWarning("[AntiDLL] {Name} ({Steam}) matched {Count} signature(s): {Sigs} — action={Action}",
-            state.Name, state.SteamStr, state.Matches.Count, sigList, action);
-
-        if (_config.NotifyAdmins)
-            NotifyAdmins(state.Name, state.SteamStr, sigList);
-
-        var actionStr = action.ToString().ToLowerInvariant();
-        if (_webhook is { Enabled: true })
-        {
-            var name     = state.Name;
-            var steamStr = state.SteamStr;
-            _ = Task.Run(() => _webhook.PostDetectionAsync(name, steamStr, sigList, actionStr));
-        }
-
-        switch (action)
-        {
-            case AntiDllAction.Notify:
-                // Log + admin notice + webhook only. No punishment (safe default).
-                break;
-
-            case AntiDllAction.Kick:
-                _bridge.ClientManager.KickClient(client, $"AntiDLL: {_config.Reason}",
-                    NetworkDisconnectionReason.KickedUntrustedAccount);
-                break;
-
-            case AntiDllAction.Ban:
-                IssueBan(client);
-                break;
-        }
-    }
-
-    private void IssueBan(IGameClient client)
-    {
-        if (_bridge.AdminService is not { } admin)
-        {
-            _logger.LogError("[AntiDLL] AdminService unavailable — falling back to kick for {Steam}",
-                (ulong) client.SteamId);
-            _bridge.ClientManager.KickClient(client, $"AntiDLL: {_config.Reason}",
-                NetworkDisconnectionReason.KickedUntrustedAccount);
-            return;
-        }
-
-        var duration = _config.BanDurationMinutes <= 0
-            ? (TimeSpan?) null
-            : TimeSpan.FromMinutes(_config.BanDurationMinutes);
-
-        // null admin = console/system actor. AdminCommands kicks the online target and persists the
-        // ban; its BanHandler then blocks the account at the connection gate on future joins.
-        admin.Ban.Ban(null, client, duration, _config.Reason);
-    }
-
-    private void NotifyAdmins(string name, string steamStr, string sigList)
-    {
-        var msg = $" [AntiDLL] {name} <{steamStr}> matched cheat signature(s): {sigList}";
-        foreach (var c in _bridge.ClientManager.GetGameClients(inGame: true))
-        {
-            if (c.IsFakeClient || c.IsHltv)
-                continue;
-            if (_bridge.AdminManager?.GetAdmin(c.SteamId) is null)
-                continue;
-            c.Print(HudPrintChannel.Chat, msg);
-        }
     }
 
     // Drop scan state if the player leaves mid-scan.

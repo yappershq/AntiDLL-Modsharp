@@ -81,8 +81,12 @@ public sealed class DllSignature
 
 public sealed class AntiDllConfig
 {
-    /// <summary>Master switch. When false the connect listener does nothing.</summary>
-    [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
+    /// <summary>
+    ///     Opt-in switch for the SECONDARY cvar-probe detector. OFF by default — the cvar probe is a
+    ///     trivially-evadable tripwire kept only as an additive signal. The PRIMARY native legacy-event
+    ///     detector is governed separately by <c>configs/antidll_legacy_events.json</c> and is on by default.
+    /// </summary>
+    [JsonPropertyName("cvarProbeEnabled")] public bool CvarProbeEnabled { get; set; } = false;
 
     /// <summary>
     ///     notify | kick | ban. DEFAULTS TO notify — signatures port from a ~1yr-old upstream and may be
@@ -135,18 +139,6 @@ public sealed class AntiDllConfig
         DefaultIgnoreCondition      = JsonIgnoreCondition.WhenWritingNull,
     };
 
-    /// <summary>
-    ///     A small starter signature set. These are EXAMPLE/PLACEHOLDER cvar names and MUST be reviewed
-    ///     against current cheats and a known-clean client before enabling enforcement. The "exists" rule
-    ///     is value-independent and the most robust style.
-    /// </summary>
-    private static List<DllSignature> DefaultSignatures() =>
-    [
-        new() { Cvar = "cl_clock_correction", RuleRaw = "not_equals", Value = "1",  Label = "clock-correction tamper (example)" },
-        new() { Cvar = "cl_predict",          RuleRaw = "not_equals", Value = "1",  Label = "prediction tamper (example)" },
-        new() { Cvar = "m_pitch",             RuleRaw = "not_equals", Value = "0.022", Label = "mouse-pitch tamper (example)" },
-    ];
-
     public static AntiDllConfig Load(string sharpPath, ILogger logger)
     {
         var path = Path.Combine(sharpPath, "configs", "antidll.json");
@@ -154,7 +146,9 @@ public sealed class AntiDllConfig
         {
             if (!File.Exists(path))
             {
-                var def = new AntiDllConfig { Signatures = DefaultSignatures() };
+                // No example/placeholder signatures shipped — the secondary cvar probe is opt-in and a
+                // bogus default cvar list would only invite false positives. Operators add their own.
+                var def = new AntiDllConfig();
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
                 File.WriteAllText(path, JsonSerializer.Serialize(def, JsonOpts));
                 logger.LogInformation("[AntiDLL] Wrote default config to {Path}", path);
@@ -165,14 +159,14 @@ public sealed class AntiDllConfig
             if (cfg is null)
             {
                 logger.LogError("[AntiDLL] antidll.json deserialized to null — using defaults");
-                return new AntiDllConfig { Signatures = DefaultSignatures() };
+                return new AntiDllConfig();
             }
             return cfg;
         }
         catch (Exception e)
         {
             logger.LogError(e, "[AntiDLL] Failed to load antidll.json — using defaults");
-            return new AntiDllConfig { Signatures = DefaultSignatures() };
+            return new AntiDllConfig();
         }
     }
 }

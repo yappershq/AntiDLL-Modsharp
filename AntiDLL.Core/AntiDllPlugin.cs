@@ -7,25 +7,39 @@ using Sharp.Shared;
 namespace AntiDLL;
 
 /// <summary>
-///     AntiDLL — detects cheat DLLs by interrogating client ConVars and acts (notify / kick / ban).
+///     AntiDLL — faithful ModSharp port of KillStr3aK / JDW1337 CS2-AntiDLL.
 ///
-///     ModSharp port inspired by KillStr3aK/CS2-AntiDLL. The upstream detects via the native legacy
-///     game-event listen-bits path (not exposed by ModSharp managed APIs); this port uses ModSharp's
-///     <see cref="Sharp.Shared.Managers.IClientManager.QueryConVar"/> primitive against a configurable,
-///     hot-refreshable signature list instead. See README for the fidelity verdict.
+///     PRIMARY detector (<see cref="LegacyEventDetector" />): a native mid-hook on
+///     <c>CSource1LegacyGameEventGameSystem::ListenBitsReceived</c>. Every time a client sends its legacy
+///     game-event subscription bitmask (<c>CLC_ListenEvents</c>), the plugin recovers the client slot from
+///     the per-client legacy proxy and asks the engine (<c>IGameEventManager2::FindListener</c>, via
+///     ModSharp's <c>IEventManager.FindListener</c>) whether the client subscribed to any blacklisted ESP
+///     event a clean client never would. This is the upstream's actual detection mechanism.
 ///
-///     Lifecycle: cross-plugin interfaces (AdminCommands / AdminManager) resolve in OnAllModulesLoaded.
+///     SECONDARY detector (<see cref="DllDetectionModule" />): an optional, OFF-by-default cvar-probe
+///     tripwire (trivially evadable; additive signal only).
+///
+///     Both funnel through a shared <see cref="DetectionSink" /> (notify / kick / ban; default = notify).
+///
+///     Lifecycle: gamedata is registered + the native hook target resolved relative to module load; the
+///     cross-plugin interfaces (AdminCommands / AdminManager) resolve in <c>OnAllModulesLoaded</c>, and the
+///     detectors are started there so they have the resolved admin services for bypass / banning.
 /// </summary>
 public sealed class AntiDllPlugin : IModSharpModule
 {
     public string DisplayName   => "AntiDLL";
-    public string DisplayAuthor => "yappershq (port of KillStr3aK/CS2-AntiDLL)";
+    public string DisplayAuthor => "yappershq (port of KillStr3aK / JDW1337 CS2-AntiDLL)";
+
+    private const string GameDataKey = "yappershq.antidll";
 
     private readonly ILogger<AntiDllPlugin> _logger;
     private readonly ILoggerFactory         _loggerFactory;
     private readonly InterfaceBridge        _bridge;
     private readonly AntiDllConfig          _config;
-    private readonly DllDetectionModule     _detection;
+    private readonly LegacyEventConfig      _legacyConfig;
+    private readonly DetectionSink          _sink;
+    private readonly LegacyEventDetector    _legacy;
+    private readonly DllDetectionModule     _cvarProbe;
 
     public AntiDllPlugin(
         ISharedSystem  sharedSystem,
@@ -38,12 +52,32 @@ public sealed class AntiDllPlugin : IModSharpModule
         _loggerFactory = sharedSystem.GetLoggerFactory();
         _logger        = _loggerFactory.CreateLogger<AntiDllPlugin>();
 
-        _bridge    = new InterfaceBridge(sharpPath, sharedSystem);
-        _config    = AntiDllConfig.Load(sharpPath, _loggerFactory.CreateLogger<AntiDllConfig>());
-        _detection = new DllDetectionModule(_bridge, _config, _loggerFactory.CreateLogger<DllDetectionModule>());
+        _bridge       = new InterfaceBridge(sharpPath, sharedSystem);
+        _config       = AntiDllConfig.Load(sharpPath, _loggerFactory.CreateLogger<AntiDllConfig>());
+        _legacyConfig = LegacyEventConfig.Load(sharpPath, _loggerFactory.CreateLogger<LegacyEventConfig>());
+
+        _sink      = new DetectionSink(_bridge, _config, _loggerFactory.CreateLogger<DetectionSink>());
+        _legacy    = new LegacyEventDetector(_bridge, _legacyConfig, _sink,
+                         _loggerFactory.CreateLogger<LegacyEventDetector>());
+        _cvarProbe = new DllDetectionModule(_bridge, _config, _sink,
+                         _loggerFactory.CreateLogger<DllDetectionModule>());
     }
 
-    public bool Init() => true;
+    public bool Init()
+    {
+        // Register gamedata early so the native hook target resolves before we install the detour.
+        try
+        {
+            _bridge.GameData.Register(GameDataKey);
+        }
+        catch (System.Exception e)
+        {
+            _logger.LogWarning(e, "[AntiDLL] gamedata register '{Key}' failed — primary detector may be unavailable",
+                GameDataKey);
+        }
+
+        return true;
+    }
 
     public void PostInit() { }
 
@@ -53,18 +87,22 @@ public sealed class AntiDllPlugin : IModSharpModule
 
         var webhook      = new DiscordWebhook(_config.DiscordWebhook, _logger);
         var sharedBypass = SharedBypass.Load(_bridge.SharpPath, _config.SharedBypassConfig, _logger);
-        _detection.Configure(webhook, sharedBypass);
+        _sink.Configure(webhook, sharedBypass);
 
-        _detection.Start();
+        // PRIMARY — native legacy-event detector. Stays OFF (logged) if the signature fails to resolve.
+        _legacy.Install();
 
-        _logger.LogInformation("[AntiDLL] Loaded (action={Action}, AdminCommands={Admin}, AdminManager={Mgr})",
-            _config.Action, _bridge.AdminService is not null, _bridge.AdminManager is not null);
+        // SECONDARY — optional cvar probe.
+        _cvarProbe.Start();
 
-        if (_config is { Enabled: true } && _config.Action != AntiDllAction.Notify && _bridge.AdminService is null
-            && _config.Action == AntiDllAction.Ban)
-        {
+        _logger.LogInformation(
+            "[AntiDLL] Loaded — action={Action}, primary(legacy-events)={Primary}, secondary(cvar-probe)={Cvar}, "
+            + "AdminCommands={Admin}, AdminManager={Mgr}",
+            _config.Action, _legacy.IsInstalled, _config.CvarProbeEnabled,
+            _bridge.AdminService is not null, _bridge.AdminManager is not null);
+
+        if (_config.Action == AntiDllAction.Ban && _bridge.AdminService is null)
             _logger.LogWarning("[AntiDLL] action=ban but AdminCommands is not loaded — bans will fall back to kicks");
-        }
     }
 
     public void OnLibraryConnected(string name) { }
@@ -73,6 +111,16 @@ public sealed class AntiDllPlugin : IModSharpModule
 
     public void Shutdown()
     {
-        _detection.Stop();
+        _legacy.Uninstall();
+        _cvarProbe.Stop();
+
+        try
+        {
+            _bridge.GameData.Unregister(GameDataKey);
+        }
+        catch
+        {
+            // best-effort
+        }
     }
 }

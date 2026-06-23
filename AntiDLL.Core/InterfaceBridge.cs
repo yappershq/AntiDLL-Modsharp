@@ -16,7 +16,10 @@ internal sealed class InterfaceBridge
     internal string SharpPath { get; }
 
     internal IModSharp           ModSharp           { get; }
+    internal IGameData           GameData           { get; }
     internal IClientManager      ClientManager      { get; }
+    internal IEventManager       EventManager       { get; }
+    internal IHookManager        HookManager        { get; }
     internal ISharpModuleManager SharpModuleManager { get; }
     internal ILoggerFactory      LoggerFactory      { get; }
 
@@ -28,7 +31,10 @@ internal sealed class InterfaceBridge
     {
         SharpPath          = sharpPath;
         ModSharp           = sharedSystem.GetModSharp();
+        GameData           = ModSharp.GetGameData();
         ClientManager      = sharedSystem.GetClientManager();
+        EventManager       = sharedSystem.GetEventManager();
+        HookManager        = sharedSystem.GetHookManager();
         SharpModuleManager = sharedSystem.GetSharpModuleManager();
         LoggerFactory      = sharedSystem.GetLoggerFactory();
     }
